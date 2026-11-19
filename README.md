@@ -1,6 +1,6 @@
-# Products app — CI example
+# Products app — reusable CI/CD example
 
-A Vue and TypeScript single-page application that displays products from the Product API. This example demonstrates application layers, dependency injection, validated HTTP responses and build-only continuous integration with GitHub Actions.
+A Vue and TypeScript single-page application that displays products from the Product API. This optional example separates a GitHub Actions caller from a reusable workflow. The caller supplies configuration; the reusable workflow type-checks and builds the app, then deploys successful `main` builds to an Azure Storage static website in a separate Test environment.
 
 ## Development environment
 
@@ -71,30 +71,54 @@ If the setting is absent, the app defaults to `http://localhost:7071/api/`. Rest
 
 Vite embeds this public setting in the generated JavaScript **at build time**. Changing it for a production build requires rebuilding the app. Never put passwords, connection strings, publishing profiles or other secrets in a `VITE_*` value: browser users can read these values.
 
-## Continuous integration
+## Reusable CI/CD workflows
 
-The [Build workflow](.github/workflows/build.yml) runs on:
+| File | Responsibility |
+| --- | --- |
+| [build-and-deploy.yml](.github/workflows/build-and-deploy.yml) | Caller: defines push, PR and manual triggers, then passes the Test API URL and Storage secret to the reusable workflow. |
+| [build-and-deploy-flow.yml](.github/workflows/build-and-deploy-flow.yml) | Reusable implementation: accepts `workflow_call` inputs and secrets, then installs, builds and conditionally deploys the app. |
 
-- A push to `main`.
-- A pull request targeting `main`.
-- A manual run using `workflow_dispatch`.
+The caller invokes the reusable workflow at job level using `uses: ./.github/workflows/build-and-deploy-flow.yml`. Both files come from the same commit. The reusable workflow runs one job on `ubuntu-latest`: it checks out the repository, selects Node.js 22 with npm caching, installs dependencies using `npm ci`, and runs `npm run build`. A later step uploads `dist` to the Storage Account's `$web` container. Both workflows limit repository permissions to `contents: read`; Azure access comes from the explicitly passed Storage secret.
 
-Its single job runs on `ubuntu-latest`, checks out the repository, selects Node.js 22 with npm caching, installs dependencies using `npm ci`, and runs `npm run build`. Repository permissions are limited to `contents: read`.
+The reusable file has no push, PR or manual trigger of its own. Start runs through the caller. The deployment step checks the caller's event and ref:
 
-The build command runs Vue/TypeScript type-checking and creates the production files in `dist`. A type error or build error fails the workflow. This is build validation; it does not verify application behaviour. There is no automated test suite in this example.
+| Trigger                       | Type-check and build | Deploy to Test           |
+| ----------------------------- | -------------------- | ------------------------ |
+| Push to `main`                | Yes                  | After a successful build |
+| Pull request targeting `main` | Yes                  | Skipped                  |
+| Manual run on `main`          | Yes                  | After a successful build |
+| Manual run on another branch  | Yes                  | Skipped                  |
 
-For clarity, the workflow explicitly sets:
+A type-check or build failure prevents deployment. PR validation does not use the Azure secret. The build does not contact the API, so it needs no running backend. This is build validation; there is no automated test suite in this example.
+
+### Inputs and secrets
+
+The caller maps repository settings to the reusable workflow's interface:
+
+| Repository setting | Passed as | Used by the reusable workflow |
+| --- | --- | --- |
+| Variable `VITE_API_BASE_URL` | String input `apiBaseUrl` | Sets the build environment variable `VITE_API_BASE_URL`. |
+| Secret `AZURE_STORAGE_CONNECTION_STRING` | Secret `storageConnectionString` | Authenticates the Azure Storage upload step. |
+
+The caller's job contains:
 
 ```yaml
-env:
-  VITE_API_BASE_URL: http://localhost:7071/api/
+jobs:
+  deploy-test:
+    uses: ./.github/workflows/build-and-deploy-flow.yml
+    with:
+      apiBaseUrl: ${{ vars.VITE_API_BASE_URL }}
+    secrets:
+      storageConnectionString: ${{ secrets.AZURE_STORAGE_CONNECTION_STRING }}
 ```
 
-This URL is embedded in the CI build output. The build does not contact the API, so no running backend is required for CI. The workflow has no deployment steps, uploaded artefacts or Azure credential requirements.
+The reusable workflow reads `${{ inputs.apiBaseUrl }}` and `${{ secrets.storageConnectionString }}`. Its API URL input is declared as a required string. The secret is optional in the `workflow_call` interface so PRs can build without Azure credentials; the deployment step requires both values to be non-empty before uploading.
 
-Ensure GitHub Actions is enabled in your private repository. Make a small change, such as changing the heading in `src/views/Products.vue`, check it locally, then commit and push to `main`. Open your repository's **Actions** tab, select **Build**, and inspect the install and build logs. Expect a successful run.
+Set the repository variable to the deployed Test API URL before deploying. Your local `.env.local` is not available to GitHub Actions.
 
-Run the same install and build commands locally with:
+This separation lets callers supply configuration while sharing build/deployment steps. In this example, the shared implementation is a local file and retains the Test-only deployment conditions above. Every run builds its own output; workflow reuse does not promote a previously built artefact or provide an approval gate. See GitHub's [reusable workflow guide](https://docs.github.com/en/actions/how-tos/reuse-automations/reuse-workflows).
+
+Run a local install and build check with:
 
 ```bash
 npm ci
@@ -109,38 +133,250 @@ npm run preview
 
 Open the URL printed by Vite. Forward the preview port if using a container, and allow that exact browser origin in backend CORS. The preview serves the existing `dist` output; it does not rebuild after configuration changes. Stop it with **Ctrl+C** when finished.
 
+## Prepare the Azure Test environment
+
+Use the course Dev Container's Bash terminal for these commands. You need an Azure subscription with permission to create a Storage Account, retrieve its connection string and update the backend Function App's CORS configuration. See the Week 5 deployment worksheet for the background on static hosting, CORS and Azure setup; the Week 9 publishing route below uses GitHub Actions.
+
+### Confirm the backend and subscription
+
+Deploy the backend using the Product service's deployment guide first. Sign in and select the intended subscription:
+
+```bash
+az login
+```
+
+```bash
+az account set --subscription 'YOUR_SUBSCRIPTION_ID'
+```
+
+```bash
+az account show --query '{name:name,id:id,tenantId:tenantId}' --output table
+```
+
+Replace the placeholders with the deployed backend's details:
+
+```bash
+API_BASE_URL='https://YOUR_FUNCTION_HOSTNAME/api/'
+FUNCTION_APP_NAME='products-test-ab47-func'
+BACKEND_GROUP='products-test-ab47-rg'
+```
+
+```bash
+curl -i "${API_BASE_URL}health/live"
+```
+
+Expect HTTP 200 with `{"status":"live"}`. Also confirm product data is available:
+
+```bash
+curl -i "${API_BASE_URL}products"
+```
+
+Expect HTTP 200 with a JSON array. Use this HTTPS API base URL, including `/api/`, for the GitHub variable below.
+
+### Provision frontend static hosting
+
+Choose a permitted region and replace `ab47` with your own short lowercase-letter-and-digit identifier. Storage Account names must be globally unique and contain 3–24 lowercase letters and digits. These naming rules apply to Azure resources, not your GitHub repository.
+
+```bash
+LAB_REGION='YOUR_PERMITTED_REGION'
+FRONTEND_GROUP='productapp-test-ab47-rg'
+FRONTEND_STORAGE='productapptestab47store'
+```
+
+Keep these variables in the same terminal. In a new terminal, reselect the subscription and restore the variables before continuing. Use a fresh, dedicated disposable frontend resource group:
+
+```bash
+az group exists --name "$FRONTEND_GROUP"
+```
+
+Expect `false`. If it returns `true`, inspect the existing group and choose a different name if it contains shared, assessment or unrelated resources.
+
+```bash
+az group create --name "$FRONTEND_GROUP" --location "$LAB_REGION" --output none
+```
+
+```bash
+az storage account create \
+  --name "$FRONTEND_STORAGE" \
+  --resource-group "$FRONTEND_GROUP" \
+  --location "$LAB_REGION" \
+  --sku Standard_LRS \
+  --kind StorageV2 \
+  --output none
+```
+
+Enable static hosting:
+
+```bash
+az storage blob service-properties update \
+  --account-name "$FRONTEND_STORAGE" \
+  --auth-mode key \
+  --static-website \
+  --index-document index.html \
+  --404-document index.html \
+  --output none
+```
+
+The index document serves the app's entry page. Azure Storage can serve `index.html` for missing paths as the error document, but this does not change a missing path's HTTP status to 200. This example's product page uses the root route. See Microsoft's [static website hosting guide](https://learn.microsoft.com/en-us/azure/storage/blobs/storage-blob-static-website-how-to?tabs=azure-cli).
+
+Obtain the **static website** endpoint:
+
+```bash
+SITE_URL=$(az storage account show --name "$FRONTEND_STORAGE" --resource-group "$FRONTEND_GROUP" --query primaryEndpoints.web --output tsv)
+```
+
+```bash
+printf '%s\n' "$SITE_URL"
+```
+
+### Allow the website origin on the backend
+
+CORS uses an origin without a path or trailing slash:
+
+```bash
+SITE_ORIGIN="${SITE_URL%/}"
+```
+
+```bash
+az functionapp cors add \
+  --name "$FUNCTION_APP_NAME" \
+  --resource-group "$BACKEND_GROUP" \
+  --allowed-origins "$SITE_ORIGIN" \
+  --output none
+```
+
+```bash
+az functionapp cors show --name "$FUNCTION_APP_NAME" --resource-group "$BACKEND_GROUP"
+```
+
+Confirm that the exact HTTPS website origin appears. Configure CORS on the Function App that receives the browser request; see the [Function App CORS reference](https://learn.microsoft.com/en-us/cli/azure/functionapp/cors). The example's website and API endpoints are public. Deployment credentials and CORS do not provide application authentication.
+
+## Configure GitHub deployment
+
+Ensure Actions is enabled in your private frontend repository. Under **Settings → Secrets and variables → Actions**, create:
+
+| Kind                | Name                              | Value                                                  |
+| ------------------- | --------------------------------- | ------------------------------------------------------ |
+| Repository variable | `VITE_API_BASE_URL`               | Your deployed HTTPS API base URL, including `/api/`    |
+| Repository secret   | `AZURE_STORAGE_CONNECTION_STRING` | The connection string for the frontend Storage Account |
+
+Use the **Variables** tab for the public API URL and the **Secrets** tab for the deployment credential. Obtain the connection string in a private terminal:
+
+```bash
+az storage account show-connection-string \
+  --name "$FRONTEND_STORAGE" \
+  --resource-group "$FRONTEND_GROUP" \
+  --query connectionString \
+  --output tsv
+```
+
+Copy the returned connection string into the secret. Keep it out of Git, screenshots and shared logs. This is a Storage account-key credential, not a Function App publishing profile or API key. The workflow uses it to authenticate the upload without an Azure login step. See the [Storage connection-string reference](https://learn.microsoft.com/en-us/cli/azure/storage/account#az-storage-account-show-connection-string).
+
+Copy **both** files from the lecturer's `feature/reusable-build` branch into the same paths on your private `main`:
+
+- `.github/workflows/build-and-deploy.yml`
+- `.github/workflows/build-and-deploy-flow.yml`
+
+If upgrading from build-only CI, remove the superseded `.github/workflows/build.yml`. If upgrading from the single-file deployment example, replace its `build-and-deploy.yml` with this caller and add the reusable file. Commit both files together: the caller cannot run without its referenced reusable workflow. Keep working on your private `main`; do not switch to the lecturer's feature branch. The workflow deploys code to the Storage Account you created above; it does not provision infrastructure.
+
+## Deploy and verify
+
+Push both workflow files and the application to `main` in your private repository:
+
+```bash
+git push origin main
+```
+
+Alternatively, select **Actions → Build and Deploy to Test → Run workflow**, choose `main`, and run it. This is the caller; **Reusable Build and Deploy** is invoked through it, rather than started manually. Expand the called job to inspect its install, type-check/build and upload steps. A PR run should show successful build validation with the upload step skipped. Manual runs on other branches also skip deployment.
+
+Open the printed `SITE_URL` in your browser. Confirm all of the following:
+
+- The page loads over HTTPS and displays the backend's product data.
+- The browser's **Network** tab shows a successful request to the deployed `/api/products` URL, rather than `localhost:7071`.
+- The **Console** shows no CORS or public-configuration errors.
+
+Make a harmless visible change, such as editing the heading in `src/views/Products.vue`, commit it and push to `main`. After Actions succeeds, reload the live website and confirm the change is visible. Publishing through Actions is sufficient; no local build or manual upload is needed for deployment. An upload succeeding does not by itself prove the browser can retrieve backend data.
+
+Capture the successful workflow, website URL and browser/API result before cleanup. If you change `VITE_API_BASE_URL` in GitHub, run the workflow again on `main` to rebuild and redeploy; changing the variable alone does not update the existing JavaScript.
+
+## Clean up disposable resources
+
+After verification and evidence capture, retire the disposable Week 9 frontend environment. Keep local development and CI available for later work:
+
+1. In `.github/workflows/build-and-deploy-flow.yml`, remove the **Deploy to Azure Storage static website** step and the `workflow_call.secrets.storageConnectionString` declaration. In the caller, remove the `secrets` mapping and set `with.apiBaseUrl` to `http://localhost:7071/api/`. Change the displayed caller workflow and job names to **Build**, and the reusable workflow name to **Reusable Build**. Commit and push both files together so later runs only build.
+2. Remove `AZURE_STORAGE_CONNECTION_STRING` and `VITE_API_BASE_URL` from the repository's Actions settings. Confirm the build-only workflow still succeeds.
+3. Check the subscription, target group and resources before deleting the dedicated frontend group:
+
+```bash
+az account show --query '{name:name,id:id}' --output table
+```
+
+```bash
+az group show --name "$FRONTEND_GROUP" --query '{name:name,id:id,location:location}' --output table
+```
+
+```bash
+az resource list --resource-group "$FRONTEND_GROUP" --query '[].{name:name,type:type}' --output table
+```
+
+Delete only the dedicated disposable frontend group after confirming it contains no shared, assessment or unrelated dependencies:
+
+```bash
+az group delete --name "$FRONTEND_GROUP"
+```
+
+The command asks for confirmation and waits for deletion. Verify removal:
+
+```bash
+az group exists --name "$FRONTEND_GROUP"
+```
+
+Expect `false`. Deleting the Storage Account invalidates its connection string. If keeping the backend, remove this retired website's CORS origin:
+
+```bash
+az functionapp cors remove --name "$FUNCTION_APP_NAME" --resource-group "$BACKEND_GROUP" --allowed-origins "$SITE_ORIGIN" --output none
+```
+
+Use the backend guide for cleanup of its dedicated Week 9 resources. Do not delete assessment or shared infrastructure. Later local development and build-only CI do not require either Week 9 Azure deployment.
+
 ## Troubleshooting
 
-| Symptom | Check |
-| --- | --- |
-| The app cannot start and mentions public configuration | Check `.env.local` for a valid API base URL, then restart Vite. |
-| Products cannot be loaded | Check that the backend is running, port 7071 is forwarded if needed, and the browser's Network tab shows the expected `/api/products` URL. |
-| The browser reports a CORS error | Allow the exact frontend origin, including scheme and port, on the backend. A successful request outside the browser does not establish that CORS is configured. |
-| The API responds but the app shows an error | Inspect the response: the app requires an array of valid products with non-empty IDs and names, and no duplicate IDs. Optional prices must be non-negative safe integers in pence; optional descriptions must be strings. |
-| Port 5173 is occupied | Stop the process already using it. This project's development server requires port 5173. |
-| CI fails | Open the failing step's log and reproduce with Node.js 22, `npm ci` and `npm run build`. Commit matching `package.json` and `package-lock.json` changes together when changing dependencies. |
+| Symptom                                                | Check                                                                                                                                                                                                                                           |
+| ------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| The app cannot start and mentions public configuration | Check `.env.local` for a valid API base URL, then restart Vite.                                                                                                                                                                                 |
+| Products cannot be loaded                              | Check that the backend is running, port 7071 is forwarded if needed, and the browser's Network tab shows the expected `/api/products` URL.                                                                                                      |
+| The browser reports a CORS error                       | Allow the exact frontend origin, including scheme and port, on the backend. A successful request outside the browser does not establish that CORS is configured.                                                                                |
+| The API responds but the app shows an error            | Inspect the response: the app requires an array of valid products with non-empty IDs and names, and no duplicate IDs. Optional prices must be non-negative safe integers in pence; optional descriptions must be strings.                       |
+| Port 5173 is occupied                                  | Stop the process already using it. This project's development server requires port 5173.                                                                                                                                                        |
+| CI fails                                               | Open the failing step's log and reproduce with Node.js 22, `npm ci` and `npm run build`. Commit matching `package.json` and `package-lock.json` changes together when changing dependencies.                                                    |
+| Upload reports missing configuration                   | Check the exact repository variable and secret names above. A local `.env.local` does not configure Actions.                                                                                                                                    |
+| The reusable workflow cannot be found | Confirm that both workflow files are committed at the documented paths in the same commit and that the caller's `uses` path matches. |
+| A reusable input or secret is missing | Check the caller's `with` and `secrets` mappings against `apiBaseUrl` and `storageConnectionString`. These interface names differ from the repository setting names. |
+| Storage upload is denied                               | Check that the connection string belongs to the frontend account and its key is valid. This example requires account-key access and a network path from the GitHub runner; subscription policy or Storage networking restrictions can block it. |
+| Upload succeeds but the live app fails                 | Check the embedded API URL, deployed backend response and exact CORS origin. Rebuild after changing the GitHub API URL variable.                                                                                                                |
+| The live page shows an older version                   | Check the run and commit on `main`, then reload with the browser cache disabled.                                                                                                                                                                |
 
 ## npm commands
 
-| Command | Purpose |
-| --- | --- |
-| `npm run dev` | Start the development server on port 5173 |
-| `npm run type-check` | Check Vue and TypeScript source |
-| `npm run build` | Type-check and generate production files in `dist` |
+| Command              | Purpose                                                   |
+| -------------------- | --------------------------------------------------------- |
+| `npm run dev`        | Start the development server on port 5173                 |
+| `npm run type-check` | Check Vue and TypeScript source                           |
+| `npm run build`      | Type-check and generate production files in `dist`        |
 | `npm run build-only` | Generate production files without the separate type-check |
-| `npm run preview` | Serve the existing production build locally |
-| `npm run format` | Format files under `src` with Prettier |
+| `npm run preview`    | Serve the existing production build locally               |
+| `npm run format`     | Format files under `src` with Prettier                    |
 
 ## Source structure
 
-| Directory | Responsibility |
-| --- | --- |
-| `src/domain` | Product list model |
-| `src/app` | List-products use case and Product service interface |
-| `src/infra` | HTTP adapter and API response validation |
-| `src/config` | Composition root and public API URL validation |
+| Directory         | Responsibility                                                |
+| ----------------- | ------------------------------------------------------------- |
+| `src/domain`      | Product list model                                            |
+| `src/app`         | List-products use case and Product service interface          |
+| `src/infra`       | HTTP adapter and API response validation                      |
+| `src/config`      | Composition root and public API URL validation                |
 | `src/composables` | Dependency injection, loading/error state and retry behaviour |
-| `src/views` | Product page and price display |
-| `src/router` | Route configuration |
+| `src/views`       | Product page and price display                                |
+| `src/router`      | Route configuration                                           |
 
 Generated files in `dist`, installed dependencies in `node_modules`, and local environment files are ignored by Git. The public configuration example and dependency lockfile are committed so a new clone can reproduce the setup. Local development and build-only CI require no Azure resources.
