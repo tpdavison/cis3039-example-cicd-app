@@ -1,0 +1,54 @@
+name: Build and Deploy to Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    env:
+      # Set this repository variable to the deployed Test API base URL, including /api/.
+      # Vite embeds this public URL in the app at build time.
+      VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type-check and build (into ./dist)
+        run: npm run build
+
+      - name: Deploy to Azure Storage static website
+        if: >-
+          github.ref == 'refs/heads/main' &&
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        uses: azure/CLI@v2
+        env:
+          AZURE_STORAGE_CONNECTION_STRING: ${{ secrets.AZURE_STORAGE_CONNECTION_STRING }}
+        with:
+          inlineScript: |
+            : "${VITE_API_BASE_URL:?Set the VITE_API_BASE_URL repository variable to the Test API base URL.}"
+            : "${AZURE_STORAGE_CONNECTION_STRING:?Set the AZURE_STORAGE_CONNECTION_STRING repository secret.}"
+
+            az storage blob upload-batch \
+              --connection-string "$AZURE_STORAGE_CONNECTION_STRING" \
+              --destination '$web' \
+              --source dist \
+              --overwrite true
